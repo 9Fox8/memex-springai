@@ -1,0 +1,171 @@
+spring:
+  # 密钥外置：从项目根目录的 .env 读取（该文件已在 .gitignore 中忽略，不会进版本库）。
+  # 也可改用系统环境变量 DEEPSEEK_API_KEY / ZHIPU_API_KEY 覆盖。
+  config:
+    import: optional:file:./.env[.properties]
+  web:
+    resources:
+      cache:
+        period: 0        # 开发期禁用静态资源缓存，前端(kb.html)改动即时生效，无需反复硬刷新
+  servlet:
+    multipart:
+      max-file-size: 20MB      # 单个附件上限（与 KnowledgeBaseController 内的显式校验保持一致）
+      max-request-size: 50MB   # 单次请求总上限
+  datasource:
+    url: jdbc:mysql://localhost:3306/ai_interview?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true
+    username: root
+    password: root
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  application:
+    name: springAi
+  ai:
+    chat:
+      memory:
+        repository:
+          jdbc:
+            schema: classpath:/sql/schema-mysql.sql
+            initialize-schema: always
+    # 显式选择模型实现：对话走 DeepSeek，向量化（入库/检索）走智谱 Zhipu
+    model:
+      embedding: openai
+    openai:
+      # —— 对话模型：DeepSeek（OpenAI 兼容协议，复用 spring-ai-starter-model-openai，无需新增依赖）——
+      api-key: ${DEEPSEEK_API_KEY}                # 见项目根目录 .env（已 gitignore）
+      base-url: https://api.deepseek.com         # 官方文档：OpenAI 兼容 base_url 不带 /v1
+      chat:
+        model: deepseek-flash
+        temperature: 0.7
+      # —— 向量化（RAG 入库/检索）用智谱 embedding-2：通过 embedding.* 覆盖 base-url / key ——
+      embedding:
+        api-key: ${ZHIPU_API_KEY}                 # 见项目根目录 .env（已 gitignore）
+        base-url: https://open.bigmodel.cn/api/paas/v4
+        model: embedding-2
+    ollama:
+      base-url: http://localhost:11434
+      chat:
+        model: qwen3:4b
+        # qwen3:4b 原生上下文为 262144，Ollama 按它分配 KV cache 需约 36 GiB，
+        # 本机内存不足会直接返回 500；显式限制上下文窗口，避免加载失败
+        num-ctx: 4096
+
+    # ===== RAG 向量库（Redis Stack / RediSearch） =====
+    # 注意：本地 Redis 必须是带 RediSearch 模块的版本（redis-stack），普通 Redis 不支持向量检索
+    vectorstore:
+      redis:
+        initialize-schema: true     # 必须显式开启，否则不会建索引（2.0 默认 false）
+        index-name: personal-kb     # 索引名称
+        prefix: "kb:"               # Redis key 前缀（含冒号需引号包裹）
+        distance-metric: COSINE     # 距离度量：COSINE / L2 / IP
+        vector-algorithm: HNSW      # 向量算法：HNSW / FLAT
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      # password: 你的Redis密码（如有，取消注释填写）
+
+app:
+  chat:
+    context-window: 20                       # 每轮对话上下文窗口大小（记忆保留消息数）
+    assistant-name: AI 助手                   # 助手对外自称
+    system-prompt-location: classpath:prompts/system-prompt.txt
+    rag:
+      top-k: 8                                # 单次检索召回文本块数
+      threshold: 0.5                          # 常规相似度阈值；“我是谁”这类间接提问改写后相似度常低于 0.7
+      fallback-threshold: 0.3                 # 兜底阈值：常规阈值查不到时降档再查一次，避免漏检
+
+    # ===== 可选对话模型清单（前端下拉框数据源）=====
+    # provider：openai = 自动装配的 DeepSeek；ollama = 本地 Ollama；
+    #           openai-compatible = 按 base-url/api-key/model 手动构造，可接任意 OpenAI 兼容厂商
+    # model-name 注入系统提示词的 ${modelName}，让每个模型回答身份时如实自报
+    models:
+      - id: deepseek
+        name: DeepSeek · deepseek-flash
+        description: 云端通用模型，推理与工具调用稳定（默认）
+        provider: openai
+        model-name: DeepSeek deepseek-flash
+      - id: zhipu
+        name: 智谱 · GLM-4.7-Flash
+        description: 智谱大模型（OpenAI 兼容），此前使用过；接口偶有超时
+        provider: openai-compatible
+        base-url: https://open.bigmodel.cn/api/paas/v4
+        api-key: ${ZHIPU_API_KEY}                 # 见项目根目录 .env（已 gitignore）
+        model: glm-4.7-flash
+        temperature: 0.7
+        model-name: 智谱 GLM-4.7-Flash
+      - id: ollama
+        name: Qwen3 4B · 本地
+        description: 本地离线模型，无需联网、响应快；复杂推理与工具调用能力较弱（需本机运行 Ollama）
+        provider: ollama
+        model-name: Qwen3 4B（本地）
+    default-model: deepseek
+
+    # ===== 失败重试 / 故障切换（由 ChatGateway 消费）=====
+    retry:
+      max-attempts: 3                   # 单个模型最多尝试 3 次（含首次），耗尽后才切换
+      backoff: 500ms                    # 退避基数，按 2^n 递增：500ms / 1000ms
+    fallback:
+      # 切换顺序：从「当前选中模型在链中的位置」往后尝试，链尾 deepseek 为最终兜底
+      # 例：选 ollama → [ollama, zhipu, deepseek]；选 zhipu → [zhipu, deepseek]；选 deepseek → [deepseek]
+      chain: [ollama, zhipu, deepseek]
+      notice: true                      # 是否在对话中提示「正在切换模型」
+    # ===== 超时（由 ChatGateway 消费）=====
+    # 流式响应按「两次输出之间的空闲时间」计算：超过 idle 没有任何新 token 即视为失败，
+    # 触发重试/切换，避免上游卡死时请求永久挂起并长期占用会话锁。
+    timeout:
+      idle: 60s
+
+  # ===== 联网搜索（多源：智谱 + DeepSeek）=====
+  # 做成 webSearch 工具交给模型自主调用：实时信息 / 最新资讯才会触发，闲聊不会。
+  # 关闭 enabled 或所有源都不可用时，工具不会暴露给模型（避免模型反复调用必然失败的工具）。
+  search:
+    enabled: true
+    # merge：并发查所有源后合并去重（信息更全，费用 = 每次提问 × 源数量）
+    # first：按 providers 的书写顺序逐个尝试，首个有结果即返回（更省费用、延迟更低）
+    mode: merge
+    count: 5                     # 每个源请求条数 1-50
+    max-results: 8               # 合并去重后最多交给模型几条
+    timeout: 15s                 # 单源单次搜索超时
+    cache-ttl: 5m                # 相同 query 的结果缓存时长，避免反复检索重复计费
+    max-snippet-chars: 600       # 单条摘要注入上限，防止搜索结果撑爆上下文
+    # key 的顺序 = first 模式的优先级
+    providers:
+      # 智谱 Web Search：复用 ZHIPU_API_KEY
+      zhipu:
+        enabled: true
+        api-key: ${ZHIPU_API_KEY}
+        base-url: https://open.bigmodel.cn/api/paas/v4/web_search
+        engine: search_std            # search_std / search_pro / search_pro_sogou / search_pro_quark
+        content-size: medium          # medium=摘要；high=更长正文（更耗 token）
+        recency: noLimit              # oneDay / oneWeek / oneMonth / oneYear / noLimit
+        # domain-filter: www.example.com   # 可选：只搜白名单域名
+      # DeepSeek Search：复用 DEEPSEEK_API_KEY，5 元 / 1000 次成功请求（空结果与失败不计费）
+      deepseek:
+        enabled: true
+        api-key: ${DEEPSEEK_API_KEY}
+        base-url: https://api.deepseek.com/v1/tools/search
+        need-content: false           # true 会返回网页正文，响应体与 token 消耗都更大
+
+  # ===== 运行时信息（每轮注入系统提示词，解决「模型不知道现在几点」）=====
+  # 模型没有时钟、训练数据也有截止日期；不注入的话问「今天几号」它只能去联网搜，
+  # 而搜索结果里是网页发布日期，必然答错。这里由 RuntimeContextAdvisor 每次请求现算。
+  runtime:
+    enabled: true
+    zone: Asia/Shanghai      # 留空则使用 JVM 默认时区
+
+  # ===== 本地文件操作沙箱（FileTools 工具允许读写的目录）=====
+  # 所有文件操作都被限制在此目录内，防止路径穿越误删系统文件；可改为绝对路径。
+  # 新建「工作区」时绑定的目录也必须落在 root 或下方 extra-roots 白名单内，否则拒绝创建。
+  file:
+    root: ./workspace
+    # 工作区沙箱之外额外允许读写的本地目录（挂载白名单），多个用英文逗号分隔；
+    # 对话中可让 AI 通过绝对路径读写这些目录（例如把信息保存到个人知识库）。
+    # 请改成你的知识库真实路径，例如: F:/我的知识库,D:/notes
+    extra-roots: F:\IdeaLocalProject\springai\workspace
+
+logging:
+  level:
+    # 用 info：debug 会把完整 prompt（含附件全文与私密对话）写进日志
+    org.springframework.ai: info
+    comg.fox.springai: info
